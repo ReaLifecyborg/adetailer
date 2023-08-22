@@ -577,12 +577,12 @@ class AfterDetailerScript(scripts.Script):
         # Saving the mask using the constructed filename and path
         self.save_mask(p, masks, filename_suffix=full_mask_path)
     
-        self.save_image(
-            p,
-            pred.preview,
-            condition="ad_save_previews",
-            suffix="-ad-preview" + suffix(n, "-"),
-        )
+        #self.save_image(
+        #    p,
+        #    pred.preview,
+        #    condition="ad_save_previews",
+        #    suffix="-ad-preview" + suffix(n, "-"),
+        #)
         steps = len(masks)
         processed = None
         state.job_count += steps
