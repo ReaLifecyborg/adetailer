@@ -20,6 +20,22 @@ cn_module_choices = [
 class Widgets(SimpleNamespace):
     def tolist(self):
         return [getattr(self, attr) for attr in ALL_ARGS.attrs]
+    ad_mask_save_path = gr.Textbox(
+        label="Inpaint Mask Save Path",
+        show_label=True,
+        lines=1,
+        placeholder="Enter the path to save the inpaint mask",
+        type="value",
+    )
+
+def on_save_mask_click(state: dict, inpaint_mask: Any, save_path: str):
+    try:
+        with open(save_path, "wb") as f:
+            f.write(inpaint_mask)
+    except Exception as e:
+        state["save_mask_status"] = f"Error: {str(e)}"
+    else:
+        state["save_mask_status"] = "Inpaint mask saved successfully."
 
 
 def gr_interactive(value: bool = True):
@@ -43,7 +59,6 @@ def on_widget_change(state: dict, value: Any, *, attr: str):
 def on_generate_click(state: dict, *values: Any):
     for attr, value in zip(ALL_ARGS.attrs, values):
         state[attr] = value
-    state["is_api"] = ()
     return state
 
 
@@ -65,7 +80,6 @@ def adui(
     num_models: int,
     is_img2img: bool,
     model_list: list[str],
-    samplers: list[str],
     t2i_button: gr.Button,
     i2i_button: gr.Button,
 ):
@@ -98,7 +112,6 @@ def adui(
                         n=n,
                         is_img2img=is_img2img,
                         model_list=model_list,
-                        samplers=samplers,
                         t2i_button=t2i_button,
                         i2i_button=i2i_button,
                     )
@@ -115,7 +128,6 @@ def one_ui_group(
     n: int,
     is_img2img: bool,
     model_list: list[str],
-    samplers: list[str],
     t2i_button: gr.Button,
     i2i_button: gr.Button,
 ):
@@ -174,10 +186,15 @@ def one_ui_group(
         with gr.Accordion(
             "Inpainting", open=False, elem_id=eid("ad_inpainting_accordion")
         ):
-            inpainting(w, n, is_img2img, samplers)
+            inpainting(w, n, is_img2img)
 
     with gr.Group():
         controlnet(w, n, is_img2img)
+
+    for attr in ALL_ARGS.attrs:
+        widget = getattr(w, attr)
+        on_change = partial(on_widget_change, attr=attr)
+        widget.change(fn=on_change, inputs=[state, widget], outputs=state, queue=False)
 
     all_inputs = [state, *w.tolist()]
     target_button = i2i_button if is_img2img else t2i_button
@@ -194,7 +211,7 @@ def detection(w: Widgets, n: int, is_img2img: bool):
     eid = partial(elem_id, n=n, is_img2img=is_img2img)
 
     with gr.Row():
-        with gr.Column(variant="compact"):
+        with gr.Column():
             w.ad_confidence = gr.Slider(
                 label="Detection model confidence threshold" + suffix(n),
                 minimum=0.0,
@@ -203,15 +220,6 @@ def detection(w: Widgets, n: int, is_img2img: bool):
                 value=0.3,
                 visible=True,
                 elem_id=eid("ad_confidence"),
-            )
-            w.ad_mask_k_largest = gr.Slider(
-                label="Mask only the top k largest (0 to disable)" + suffix(n),
-                minumum=0,
-                maximum=10,
-                step=1,
-                value=0,
-                visible=True,
-                elem_id=eid("ad_mask_k_largest"),
             )
 
         with gr.Column(variant="compact"):
@@ -285,27 +293,27 @@ def inpainting(w: Widgets, n: int, is_img2img: bool, samplers: list[str]):
 
     with gr.Group():
         with gr.Row():
-            w.ad_mask_blur = gr.Slider(
-                label="Inpaint mask blur" + suffix(n),
-                minimum=0,
-                maximum=64,
-                step=1,
-                value=4,
-                visible=True,
-                elem_id=eid("ad_mask_blur"),
-            )
+            with gr.Column(variant="compact"):
+                w.ad_mask_blur = gr.Slider(
+                    label="Inpaint mask blur" + suffix(n),
+                    minimum=0,
+                    maximum=64,
+                    step=1,
+                    value=4,
+                    visible=True,
+                    elem_id=eid("ad_mask_blur"),
+                )
 
-            w.ad_denoising_strength = gr.Slider(
-                label="Inpaint denoising strength" + suffix(n),
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=0.4,
-                visible=True,
-                elem_id=eid("ad_denoising_strength"),
-            )
+                w.ad_denoising_strength = gr.Slider(
+                    label="Inpaint denoising strength" + suffix(n),
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.4,
+                    visible=True,
+                    elem_id=eid("ad_denoising_strength"),
+                )
 
-        with gr.Row():
             with gr.Column(variant="compact"):
                 w.ad_inpaint_only_masked = gr.Checkbox(
                     label="Inpaint only masked" + suffix(n),
@@ -330,6 +338,35 @@ def inpainting(w: Widgets, n: int, is_img2img: bool, samplers: list[str]):
                     queue=False,
                 )
 
+        with gr.Row():
+            w.ad_inpaint_mask = gr.File(label="Inpaint Mask" + suffix(n), type="value")
+
+            w.ad_mask_save_path = gr.Textbox(
+                label="Inpaint Mask Save Path",
+                show_label=True,
+                lines=1,
+                placeholder="Enter the path to save the inpaint mask",
+                type="value",
+            )
+
+            w.ad_mask_save_button = gr.Button(
+                label="Save Inpaint Mask",
+                elem_id=eid("ad_mask_save_button"),
+            )
+
+            w.ad_mask_save_button.click(
+                on_save_mask_click,
+                inputs={
+                    "inpaint_mask": w.ad_inpaint_mask,
+                    "save_path": w.ad_mask_save_path,
+                },
+                outputs={"save_mask_status": True},
+                queue=False,
+            )
+
+            w.ad_mask_save_status = gr.Label(
+                label="", elem_id=eid("ad_mask_save_status")
+            )
             with gr.Column(variant="compact"):
                 w.ad_use_inpaint_width_height = gr.Checkbox(
                     label="Use separate width/height" + suffix(n),
@@ -418,29 +455,6 @@ def inpainting(w: Widgets, n: int, is_img2img: bool, samplers: list[str]):
 
         with gr.Row():
             with gr.Column(variant="compact"):
-                w.ad_use_sampler = gr.Checkbox(
-                    label="Use separate sampler" + suffix(n),
-                    value=False,
-                    visible=True,
-                    elem_id=eid("ad_use_sampler"),
-                )
-
-                w.ad_sampler = gr.Dropdown(
-                    label="ADetailer sampler" + suffix(n),
-                    choices=samplers,
-                    value=samplers[0],
-                    visible=True,
-                    elem_id=eid("ad_sampler"),
-                )
-
-                w.ad_use_sampler.change(
-                    gr_interactive,
-                    inputs=w.ad_use_sampler,
-                    outputs=w.ad_sampler,
-                    queue=False,
-                )
-
-            with gr.Column(variant="compact"):
                 w.ad_use_noise_multiplier = gr.Checkbox(
                     label="Use separate noise multiplier" + suffix(n),
                     value=False,
@@ -465,38 +479,11 @@ def inpainting(w: Widgets, n: int, is_img2img: bool, samplers: list[str]):
                     queue=False,
                 )
 
-        with gr.Row():
-            with gr.Column(variant="compact"):
-                w.ad_use_clip_skip = gr.Checkbox(
-                    label="Use separate CLIP skip" + suffix(n),
-                    value=False,
-                    visible=True,
-                    elem_id=eid("ad_use_clip_skip"),
-                )
-
-                w.ad_clip_skip = gr.Slider(
-                    label="ADetailer CLIP skip" + suffix(n),
-                    minimum=1,
-                    maximum=12,
-                    step=1,
-                    value=1,
-                    visible=True,
-                    elem_id=eid("ad_clip_skip"),
-                )
-
-                w.ad_use_clip_skip.change(
-                    gr_interactive,
-                    inputs=w.ad_use_clip_skip,
-                    outputs=w.ad_clip_skip,
-                    queue=False,
-                )
-
-            with gr.Column(variant="compact"):
-                w.ad_restore_face = gr.Checkbox(
-                    label="Restore faces after ADetailer" + suffix(n),
-                    value=False,
-                    elem_id=eid("ad_restore_face"),
-                )
+            w.ad_restore_face = gr.Checkbox(
+                label="Restore faces after ADetailer" + suffix(n),
+                value=False,
+                elem_id=eid("ad_restore_face"),
+            )
 
 
 def controlnet(w: Widgets, n: int, is_img2img: bool):
