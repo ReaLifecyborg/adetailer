@@ -567,11 +567,15 @@ class AfterDetailerScript(scripts.Script):
             )
             return False
 
-        # Constructing the mask filename based on index, settings, and step number
+      # Constructing the mask filename based on index, settings, and step number
         mask_filename = f"mask_{i + 1}_settings_{args}_step_{n}.png"
 
-        # Saving the mask using the constructed filename
-        self.save_mask(p, masks, filename_suffix=mask_filename)
+        # Constructing the full path to save the mask
+        mask_path = "/home/streamline/sd-webui-docker/output/mask"  # Modify this path accordingly
+        full_mask_path = os.path.join(mask_path, mask_filename)
+
+        # Saving the mask using the constructed filename and path
+        self.save_mask(p, masks, filename_suffix=full_mask_path)
     
         self.save_image(
             p,
@@ -579,7 +583,6 @@ class AfterDetailerScript(scripts.Script):
             condition="ad_save_previews",
             suffix="-ad-preview" + suffix(n, "-"),
         )
-
         steps = len(masks)
         processed = None
         state.job_count += steps
