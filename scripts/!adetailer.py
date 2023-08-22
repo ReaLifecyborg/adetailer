@@ -5,7 +5,7 @@ import platform
 import re
 import sys
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import copy, deepcopy
 from functools import partial
 from pathlib import Path
@@ -14,7 +14,6 @@ from typing import Any
 
 import gradio as gr
 import torch
-from rich import print
 
 import modules
 from adetailer import (
@@ -26,36 +25,32 @@ from adetailer import (
 )
 from adetailer.args import ALL_ARGS, BBOX_SORTBY, ADetailerArgs, EnableChecker
 from adetailer.common import PredictOutput
-from adetailer.mask import (
-    filter_by_ratio,
-    filter_k_largest,
-    mask_preprocess,
-    sort_bboxes,
-)
-from adetailer.traceback import rich_traceback
+from adetailer.mask import filter_by_ratio, mask_preprocess, sort_bboxes
 from adetailer.ui import adui, ordinal, suffix
 from controlnet_ext import ControlNetExt, controlnet_exists, get_cn_models
 from controlnet_ext.restore import (
     CNHijackRestore,
     cn_allow_script_control,
+    cn_restore_unet_hook,
 )
 from sd_webui import images, safe, script_callbacks, scripts, shared
-from sd_webui.devices import NansException
 from sd_webui.paths import data_path, models_path
 from sd_webui.processing import (
-    Processed,
     StableDiffusionProcessingImg2Img,
     create_infotext,
     process_images,
 )
-from sd_webui.sd_samplers import all_samplers
 from sd_webui.shared import cmd_opts, opts, state
+
+with suppress(ImportError):
+    from rich import print
+
 
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
 adetailer_dir = Path(models_path, "adetailer")
 model_mapping = get_models(adetailer_dir, huggingface=not no_huggingface)
 txt2img_submit_button = img2img_submit_button = None
-SCRIPT_DEFAULT = "dynamic_prompting,dynamic_thresholding,wildcard_recursive,wildcards,lora_block_weight"
+SCRIPT_DEFAULT = "dynamic_prompting,dynamic_thresholding,wildcard_recursive,wildcards"
 
 if (
     not adetailer_dir.exists()
@@ -89,26 +84,14 @@ def pause_total_tqdm():
         opts.data["multiple_tqdm"] = orig
 
 
-@contextmanager
-def preseve_prompts(p):
-    all_pt = copy(p.all_prompts)
-    all_ng = copy(p.all_negative_prompts)
-    try:
-        yield
-    finally:
-        p.all_prompts = all_pt
-        p.all_negative_prompts = all_ng
-
-
 class AfterDetailerScript(scripts.Script):
     def __init__(self):
         super().__init__()
         self.ultralytics_device = self.get_ultralytics_device()
 
         self.controlnet_ext = None
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(version={__version__})"
+        self.cn_script = None
+        self.cn_latest_network = None
 
     def title(self):
         return AFTER_DETAILER
@@ -119,13 +102,11 @@ class AfterDetailerScript(scripts.Script):
     def ui(self, is_img2img):
         num_models = opts.data.get("ad_max_models", 2)
         model_list = list(model_mapping.keys())
-        samplers = [sampler.name for sampler in all_samplers]
 
         components, infotext_fields = adui(
             num_models,
             is_img2img,
             model_list,
-            samplers,
             txt2img_submit_button,
             img2img_submit_button,
         )
@@ -218,6 +199,22 @@ class AfterDetailerScript(scripts.Script):
         params["ADetailer version"] = __version__
         return params
 
+    def save_mask(self, p, masks, filename_suffix=""):
+        i = p._ad_idx
+        if p.all_prompts:
+            i %= len(p.all_prompts)
+        seed, _ = self.get_seed(p)
+
+        save_prompt = p.all_prompts[i] if p.all_prompts else p.prompt
+        filename = f"mask-{seed}{filename_suffix}.png"
+        save_path = Path(p.outpath_samples, filename)
+
+        combined_mask = sum(masks)
+        combined_mask = (combined_mask * 255).astype(np.uint8)
+
+        Image.fromarray(combined_mask).save(save_path)
+        print(f"[-] ADetailer: Mask saved as {filename}")
+
     @staticmethod
     def get_ultralytics_device() -> str:
         if "adetailer" in shared.cmd_opts.use_cpu:
@@ -249,12 +246,10 @@ class AfterDetailerScript(scripts.Script):
         for n in range(len(prompts)):
             if not prompts[n]:
                 prompts[n] = blank_replacement
-            elif "[PROMPT]" in prompts[n]:
-                prompts[n] = prompts[n].replace("[PROMPT]", f" {blank_replacement} ")
         return prompts
 
     def get_prompt(self, p, args: ADetailerArgs) -> tuple[list[str], list[str]]:
-        i = p._ad_idx
+        i = p._idx
 
         prompt = self._get_prompt(args.ad_prompt, p.all_prompts, i, p.prompt)
         negative_prompt = self._get_prompt(
@@ -264,7 +259,7 @@ class AfterDetailerScript(scripts.Script):
         return prompt, negative_prompt
 
     def get_seed(self, p) -> tuple[int, int]:
-        i = p._ad_idx
+        i = p._idx
 
         if not p.all_seeds:
             seed = p.seed
@@ -304,26 +299,12 @@ class AfterDetailerScript(scripts.Script):
             return args.ad_cfg_scale
         return p.cfg_scale
 
-    def get_sampler(self, p, args: ADetailerArgs) -> str:
-        sampler_name = args.ad_sampler if args.ad_use_sampler else p.sampler_name
-
-        if sampler_name in ["PLMS", "UniPC"]:
-            sampler_name = "Euler"
-        return sampler_name
-
-    def get_override_settings(self, p, args: ADetailerArgs) -> dict[str, Any]:
-        d = {}
-        if args.ad_use_clip_skip:
-            d["CLIP_stop_at_last_layers"] = args.ad_clip_skip
-        return d
-
     def get_initial_noise_multiplier(self, p, args: ADetailerArgs) -> float | None:
         if args.ad_use_noise_multiplier:
             return args.ad_noise_multiplier
         return None
 
-    @staticmethod
-    def infotext(p) -> str:
+    def infotext(self, p) -> str:
         return create_infotext(
             p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
         )
@@ -358,6 +339,9 @@ class AfterDetailerScript(scripts.Script):
             filename = Path(filepath).stem
             if filename in script_names_set:
                 filtered_alwayson.append(script_object)
+            if filename == "controlnet":
+                self.cn_script = script_object
+                self.cn_latest_network = script_object.latest_network
 
         script_runner.alwayson_scripts = filtered_alwayson
         return script_runner, script_args
@@ -379,8 +363,10 @@ class AfterDetailerScript(scripts.Script):
         steps = self.get_steps(p, args)
         cfg_scale = self.get_cfg_scale(p, args)
         initial_noise_multiplier = self.get_initial_noise_multiplier(p, args)
-        sampler_name = self.get_sampler(p, args)
-        override_settings = self.get_override_settings(p, args)
+
+        sampler_name = p.sampler_name
+        if sampler_name in ["PLMS", "UniPC"]:
+            sampler_name = "Euler"
 
         i2i = StableDiffusionProcessingImg2Img(
             init_images=[image],
@@ -416,11 +402,8 @@ class AfterDetailerScript(scripts.Script):
             extra_generation_params=p.extra_generation_params,
             do_not_save_samples=True,
             do_not_save_grid=True,
-            override_settings=override_settings,
         )
 
-        i2i.cached_c = [None, None]
-        i2i.cached_uc = [None, None]
         i2i.scripts, i2i.script_args = self.script_filter(p, args)
         i2i._disable_adetailer = True
 
@@ -432,12 +415,7 @@ class AfterDetailerScript(scripts.Script):
         return i2i
 
     def save_image(self, p, image, *, condition: str, suffix: str) -> None:
-        i = p._ad_idx
-        if p.all_prompts:
-            i %= len(p.all_prompts)
-            save_prompt = p.all_prompts[i]
-        else:
-            save_prompt = p.prompt
+        i = p._idx
         seed, _ = self.get_seed(p)
 
         if opts.data.get(condition, False):
@@ -446,7 +424,7 @@ class AfterDetailerScript(scripts.Script):
                 path=p.outpath_samples,
                 basename="",
                 seed=seed,
-                prompt=save_prompt,
+                prompt=p.all_prompts[i] if i < len(p.all_prompts) else p.prompt,
                 extension=opts.samples_format,
                 info=self.infotext(p),
                 p=p,
@@ -468,7 +446,6 @@ class AfterDetailerScript(scripts.Script):
         pred = filter_by_ratio(
             pred, low=args.ad_mask_min_ratio, high=args.ad_mask_max_ratio
         )
-        pred = filter_k_largest(pred, k=args.ad_mask_k_largest)
         pred = self.sort_bboxes(pred)
         return mask_preprocess(
             pred.masks,
@@ -478,15 +455,8 @@ class AfterDetailerScript(scripts.Script):
             merge_invert=args.ad_mask_merge_invert,
         )
 
-    @staticmethod
-    def ensure_rgb_image(image: Any):
-        if hasattr(image, "mode") and image.mode != "RGB":
-            image = image.convert("RGB")
-        return image
-
-    @staticmethod
     def i2i_prompts_replace(
-        i2i, prompts: list[str], negative_prompts: list[str], j: int
+        self, i2i, prompts: list[str], negative_prompts: list[str], j: int
     ) -> None:
         i1 = min(j, len(prompts) - 1)
         i2 = min(j, len(negative_prompts) - 1)
@@ -495,31 +465,12 @@ class AfterDetailerScript(scripts.Script):
         i2i.prompt = prompt
         i2i.negative_prompt = negative_prompt
 
-    @staticmethod
-    def compare_prompt(p, processed, n: int = 0):
-        if p.prompt != processed.all_prompts[0]:
-            print(
-                f"[-] ADetailer: applied {ordinal(n + 1)} ad_prompt: {processed.all_prompts[0]!r}"
-            )
-
-        if p.negative_prompt != processed.all_negative_prompts[0]:
-            print(
-                f"[-] ADetailer: applied {ordinal(n + 1)} ad_negative_prompt: {processed.all_negative_prompts[0]!r}"
-            )
-
-    @staticmethod
-    def need_call_process(p) -> bool:
-        i = p._ad_idx
+    def is_need_call_process(self, p) -> bool:
+        i = p._idx
+        n_iter = p.iteration
         bs = p.batch_size
-        return i % bs == bs - 1
+        return (i == (n_iter + 1) * bs - 1) and (i != len(p.all_prompts) - 1)
 
-    @staticmethod
-    def need_call_postprocess(p) -> bool:
-        i = p._ad_idx
-        bs = p.batch_size
-        return i % bs == 0
-
-    @rich_traceback
     def process(self, p, *args_):
         if getattr(p, "_disable_adetailer", False):
             return
@@ -529,6 +480,8 @@ class AfterDetailerScript(scripts.Script):
             extra_params = self.extra_params(arg_list)
             p.extra_generation_params.update(extra_params)
 
+            p._idx = -1
+
     def _postprocess_image(self, p, pp, args: ADetailerArgs, *, n: int = 0) -> bool:
         """
         Returns
@@ -537,10 +490,11 @@ class AfterDetailerScript(scripts.Script):
 
             `True` if image was processed, `False` otherwise.
         """
+        
         if state.interrupted:
             return False
 
-        i = p._ad_idx
+        i = p._idx
 
         i2i = self.get_i2i_p(p, args, pp.image)
         seed, subseed = self.get_seed(p)
@@ -560,7 +514,7 @@ class AfterDetailerScript(scripts.Script):
         with change_torch_load():
             pred = predictor(ad_model, pp.image, args.ad_confidence, **kwargs)
 
-        masks = self.pred_preprocessing(pred, args)
+       masks = self.pred_preprocessing(pred, args)
 
         if not masks:
             print(
@@ -568,6 +522,8 @@ class AfterDetailerScript(scripts.Script):
             )
             return False
 
+        self.save_mask(p, masks, filename_suffix=suffix(n, "-mask"))
+        
         self.save_image(
             p,
             pred.preview,
@@ -585,27 +541,18 @@ class AfterDetailerScript(scripts.Script):
         p2 = copy(i2i)
         for j in range(steps):
             p2.image_mask = masks[j]
-            p2.init_images[0] = self.ensure_rgb_image(p2.init_images[0])
             self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
 
-            if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
-                continue
-
-            p2.seed = seed + j
-            p2.subseed = subseed + j
-
-            try:
+            if not re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
+                if args.ad_controlnet_model == "None":
+                    cn_restore_unet_hook(p2, self.cn_latest_network)
                 processed = process_images(p2)
-            except NansException as e:
-                msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
-                print(msg, file=sys.stderr)
-                continue
-            finally:
-                p2.close()
 
-            self.compare_prompt(p2, processed, n=n)
-            p2 = copy(i2i)
-            p2.init_images = [processed.images[0]]
+                p2 = copy(i2i)
+                p2.init_images = [processed.images[0]]
+
+            p2.seed = seed + j + 1
+            p2.subseed = subseed + j + 1
 
         if processed is not None:
             pp.image = processed.images[0]
@@ -613,7 +560,6 @@ class AfterDetailerScript(scripts.Script):
 
         return False
 
-    @rich_traceback
     def postprocess_image(self, p, pp, *args_):
         if getattr(p, "_disable_adetailer", False):
             return
@@ -621,14 +567,9 @@ class AfterDetailerScript(scripts.Script):
         if not self.is_ad_enabled(*args_):
             return
 
-        p._ad_idx = getattr(p, "_ad_idx", -1) + 1
+        p._idx = getattr(p, "_idx", -1) + 1
         init_image = copy(pp.image)
         arg_list = self.get_args(p, *args_)
-
-        if p.scripts is not None and self.need_call_postprocess(p):
-            dummy = Processed(p, [], p.seed, "")
-            with preseve_prompts(p):
-                p.scripts.postprocess(copy(p), dummy)
 
         is_processed = False
         with CNHijackRestore(), pause_total_tqdm(), cn_allow_script_control():
@@ -642,14 +583,11 @@ class AfterDetailerScript(scripts.Script):
                 p, init_image, condition="ad_save_images_before", suffix="-ad-before"
             )
 
-        if p.scripts is not None and self.need_call_process(p):
-            with preseve_prompts(p):
-                p.scripts.process(copy(p))
+        if self.cn_script is not None and self.is_need_call_process(p):
+            self.cn_script.process(p)
 
         try:
-            ia = p._ad_idx
-            lenp = len(p.all_prompts)
-            if ia % lenp == lenp - 1:
+            if p._idx == len(p.all_prompts) - 1:
                 self.write_params_txt(p)
         except Exception:
             pass
@@ -722,6 +660,28 @@ def on_ui_settings():
         ),
     )
 
+#added function for saving the mask instead of full process
+def process_and_save_inpaint_mask(args, inpaint_mask, data_path, suffix=""):
+    is_mediapipe = args.ad_model.lower().startswith("mediapipe")
+    predictor = mediapipe_predict if is_mediapipe else ultralytics_predict
+    kwargs = {} if is_mediapipe else {"device": args.ultralytics_device}
+
+    with change_torch_load():
+        pred = predictor(args.ad_model, inpaint_mask, args.ad_confidence, **kwargs)
+
+    masks = pred_preprocessing(pred, args)
+    if not masks:
+        print(f"[-] ADetailer: no detections in inpaint mask with settings: {args!r}")
+        return
+
+    for j, mask in enumerate(masks):
+        save_path = os.path.join(
+            data_path,
+            f"inpaint_masks",
+            f"mask_seed{args.seed}_subseed{args.subseed}_prompt{ordinal(j + 1)}{suffix}.png",
+        )
+        mask.save(save_path)
+        print(f"[-] ADetailer: saved inpaint mask to {save_path}")
 
 # xyz_grid
 
@@ -737,7 +697,6 @@ def make_axis_on_xyz_grid():
         return
 
     model_list = ["None", *model_mapping.keys()]
-    samplers = [sampler.name for sampler in all_samplers]
 
     def set_value(p, x, xs, *, field: str):
         if not hasattr(p, "adetailer_xyz"):
@@ -781,12 +740,6 @@ def make_axis_on_xyz_grid():
             "[ADetailer] Inpaint only masked padding 1st",
             int,
             partial(set_value, field="ad_inpaint_only_masked_padding"),
-        ),
-        xyz_grid.AxisOption(
-            "[ADetailer] ADetailer sampler 1st",
-            str,
-            partial(set_value, field="ad_sampler"),
-            choices=lambda: samplers,
         ),
         xyz_grid.AxisOption(
             "[ADetailer] ControlNet model 1st",
